@@ -1,0 +1,100 @@
+name: Research 7.1 world player revive parameter users
+
+on:
+  push:
+    branches:
+      - research/world-player-revive
+    paths:
+      - '.github/workflows/research-world-player-revive-param-users.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  map-response-parameter-users:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Map candidate response consumers
+        run: |
+          python - <<'PY'
+          import csv, json
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path('versions/7.1.0-global/windows-x64')
+          methods_path = root / 'metadata/methods.csv'
+          fields_path = root / 'metadata/fields.csv'
+          registry_path = root / 'registry/registry.csv'
+
+          response_types = {
+              4761: 'CHPMLJLBLCB',
+              7003: 'GFPMFMJPNMA',
+              8223: 'LOGPEGIEACK',
+              9129: 'INDKHBFONJA',
+              22904: 'MOKBJEHGENJ',
+              23684: 'JMMBKLEPMMC',
+              24380: 'HIADLALFEFD',
+          }
+          revive_request_type = 'OCEMECOHKDK'
+          revive_owner_types = {'EDKMMIPJHJA', 'BMMDCOLHAOE', 'KKJPPPLJAAG', 'AGHDHMPNDMC', 'AGLDLBEJKHP'}
+
+          users = defaultdict(list)
+          methods_by_owner = defaultdict(list)
+          with methods_path.open(encoding='utf-8', newline='') as f:
+              for row in csv.DictReader(f):
+                  try:
+                      params = json.loads(row.get('parameter_types') or '[]')
+                  except json.JSONDecodeError:
+                      params = []
+                  compact = {k: row.get(k) for k in ('method_index','type_definition_index','type_name','method_name','rva','return_type','parameter_types','parameter_count','name_token')}
+                  if row.get('type_name') in revive_owner_types:
+                      methods_by_owner[row['type_name']].append(compact)
+                  for p in params:
+                      if p in response_types.values() or p == revive_request_type:
+                          users[p].append(compact)
+
+          fields_by_owner = defaultdict(list)
+          with fields_path.open(encoding='utf-8', newline='') as f:
+              for row in csv.DictReader(f):
+                  if row.get('type_name') in revive_owner_types:
+                      fields_by_owner[row['type_name']].append(dict(row))
+
+          result = {
+              'request': {
+                  'type_name': revive_request_type,
+                  'parameter_users': users.get(revive_request_type, []),
+                  'owner_types': sorted(revive_owner_types),
+              },
+              'responses': {},
+              'request_owner_fields': fields_by_owner,
+          }
+          for cmd_id, t in response_types.items():
+              rows = users.get(t, [])
+              result['responses'][str(cmd_id)] = {
+                  'type_name': t,
+                  'parameter_users': rows,
+                  'overlap_with_request_owner_types': [r for r in rows if r.get('type_name') in revive_owner_types],
+              }
+
+          Path('revive-response-param-users.json').write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+          print(json.dumps({
+              cmd: {
+                  'type_name': v['type_name'],
+                  'user_count': len(v['parameter_users']),
+                  'users': v['parameter_users'],
+                  'overlap': v['overlap_with_request_owner_types'],
+              }
+              for cmd, v in result['responses'].items()
+          }, indent=2, ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: revive-response-param-users
+          path: revive-response-param-users.json
+          if-no-files-found: error
+          retention-days: 7
