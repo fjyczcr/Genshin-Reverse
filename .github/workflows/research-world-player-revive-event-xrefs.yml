@@ -1,0 +1,147 @@
+name: Research 7.1 world player revive event xrefs
+
+on:
+  push:
+    branches:
+      - research/world-player-revive
+    paths:
+      - '.github/workflows/research-world-player-revive-event-xrefs.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  trace-response-event-xrefs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install focused research dependencies
+        run: python -m pip install -e . zstandard
+      - name: Fetch pinned exact 7.1 Global samples
+        run: bash scripts/fetch-7.1-samples.sh --output inputs/7.1.0-global --python python
+      - name: Trace callback displacement byte xrefs
+        run: |
+          python - <<'PY'
+          import bisect
+          import csv
+          import json
+          import struct
+          from collections import defaultdict
+          from pathlib import Path
+
+          from genshinre.pe import PEImage
+
+          root = Path('versions/7.1.0-global/windows-x64')
+          exe = Path('inputs/7.1.0-global/GenshinImpact.exe')
+          methods_path = root / 'metadata/methods.csv'
+
+          candidates = {
+              0x274F78: {'cmd_id': 4761, 'message_type': 'CHPMLJLBLCB', 'handler_rva': '0xC227720'},
+              0x2752C0: {'cmd_id': 7003, 'message_type': 'GFPMFMJPNMA', 'handler_rva': '0xC241960'},
+              0x2753D0: {'cmd_id': 8223, 'message_type': 'LOGPEGIEACK', 'handler_rva': '0xC244030'},
+              0x275770: {'cmd_id': 9129, 'message_type': 'INDKHBFONJA', 'handler_rva': '0xC2538A0'},
+              0x275600: {'cmd_id': 22904, 'message_type': 'MOKBJEHGENJ', 'handler_rva': '0xC25D710'},
+              0x275EB8: {'cmd_id': 23684, 'message_type': 'JMMBKLEPMMC', 'handler_rva': '0xC256150'},
+              0x275368: {'cmd_id': 24380, 'message_type': 'HIADLALFEFD', 'handler_rva': '0xC2433E0'},
+          }
+
+          starts = []
+          rows_by_start = defaultdict(list)
+          with methods_path.open(encoding='utf-8', newline='') as f:
+              for row in csv.DictReader(f):
+                  text = row.get('rva') or ''
+                  if not text:
+                      continue
+                  try:
+                      rva = int(text, 0)
+                  except ValueError:
+                      continue
+                  if rva <= 0:
+                      continue
+                  starts.append(rva)
+                  rows_by_start[rva].append(row)
+          starts = sorted(set(starts))
+
+          def owner_for(site):
+              pos = bisect.bisect_right(starts, site) - 1
+              if pos < 0:
+                  return []
+              start = starts[pos]
+              if site - start > 0x10000:
+                  return []
+              return [
+                  {
+                      'method_index': r.get('method_index'),
+                      'type_definition_index': r.get('type_definition_index'),
+                      'type_name': r.get('type_name'),
+                      'method_name': r.get('method_name'),
+                      'rva': r.get('rva'),
+                      'parameter_types': r.get('parameter_types'),
+                  }
+                  for r in rows_by_start[start]
+              ]
+
+          hits = []
+          with PEImage(exe) as image:
+              for sec in image.sections:
+                  if not (sec.characteristics & 0x20000000):
+                      continue
+                  blob = image.read_rva(sec.virtual_address, sec.raw_size)
+                  for disp, candidate in candidates.items():
+                      pat = struct.pack('<I', disp)
+                      pos = 0
+                      while True:
+                          idx = blob.find(pat, pos)
+                          if idx < 0:
+                              break
+                          site = sec.virtual_address + idx
+                          lo = max(0, idx - 16)
+                          hi = min(len(blob), idx + 20)
+                          hits.append({
+                              'candidate': candidate,
+                              'displacement': f'0x{disp:X}',
+                              'pattern_rva': f'0x{site:X}',
+                              'section': sec.name,
+                              'context_rva': f'0x{sec.virtual_address + lo:X}',
+                              'context_hex': blob[lo:hi].hex(),
+                              'owner_methods': owner_for(site),
+                          })
+                          pos = idx + 1
+
+          grouped = defaultdict(list)
+          for hit in hits:
+              grouped[str(hit['candidate']['cmd_id'])].append(hit)
+
+          result = {
+              'schema': 'genshin-revive-response-event-xrefs-v1',
+              'candidates': {f'0x{k:X}': v for k, v in candidates.items()},
+              'hit_count': len(hits),
+              'hits_by_cmd_id': dict(grouped),
+              'notes': [
+                  'These are raw disp32 byte-pattern xrefs. Validate instruction boundaries before semantic use.',
+                  'The response-handler self-reference should appear for every candidate and acts as a control.',
+                  'Non-handler owner methods are the useful leads for callback registration or consumption.'
+              ]
+          }
+          Path('revive-response-event-xrefs.json').write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+          print(json.dumps({
+              'hit_count': len(hits),
+              'summary': {
+                  cmd: [
+                      {'pattern_rva': h['pattern_rva'], 'owner_methods': h['owner_methods']}
+                      for h in hs
+                  ]
+                  for cmd, hs in grouped.items()
+              }
+          }, indent=2, ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: revive-response-event-xrefs
+          path: revive-response-event-xrefs.json
+          if-no-files-found: error
+          retention-days: 7
