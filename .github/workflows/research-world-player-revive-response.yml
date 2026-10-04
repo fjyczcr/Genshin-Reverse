@@ -1,0 +1,224 @@
+name: Research 7.1 world player revive response
+
+on:
+  push:
+    branches:
+      - research/world-player-revive
+    paths:
+      - '.github/workflows/research-world-player-revive-response.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  correlate-response-candidates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install focused research dependencies
+        run: python -m pip install -e . capstone zstandard
+      - name: Fetch pinned exact 7.1 Global samples
+        run: bash scripts/fetch-7.1-samples.sh --output inputs/7.1.0-global --python python
+      - name: Correlate one-int32 response candidates with native handlers
+        run: |
+          python - <<'PY'
+          import bisect
+          import csv
+          import json
+          from collections import defaultdict
+          from pathlib import Path
+
+          from capstone import CS_ARCH_X86, CS_MODE_64, CS_OP_IMM, CS_OP_MEM, Cs
+          from capstone.x86_const import X86_REG_RIP
+
+          from genshinre.pe import PEImage
+
+          root = Path('versions/7.1.0-global/windows-x64')
+          exe = Path('inputs/7.1.0-global/GenshinImpact.exe')
+          registry_path = root / 'registry/registry.csv'
+          methods_path = root / 'metadata/methods.csv'
+          fields_path = root / 'metadata/fields.csv'
+
+          with registry_path.open(encoding='utf-8', newline='') as f:
+              registry = list(csv.DictReader(f))
+          by_type = {r['type_name']: r for r in registry}
+          slot_to_registry = {
+              int(r['type_slot_rva'], 0): r
+              for r in registry
+              if r.get('type_slot_rva')
+          }
+
+          fields_by_type = defaultdict(list)
+          with fields_path.open(encoding='utf-8', newline='') as f:
+              for row in csv.DictReader(f):
+                  fields_by_type[row.get('type_name', '')].append(row)
+
+          candidates = []
+          for type_name, reg in by_type.items():
+              fs = fields_by_type.get(type_name, [])
+              if len(fs) != 1:
+                  continue
+              fld = fs[0]
+              if fld.get('field_type') == 'int32' and fld.get('field_name') == 'BLPJNJBFDJJ':
+                  candidates.append({
+                      'cmd_id': int(reg['cmd_id']),
+                      'type_name': type_name,
+                      'type_slot_rva': reg.get('type_slot_rva'),
+                      'get_cmd_id_rva': reg.get('get_cmd_id_rva'),
+                      'field': fld,
+                  })
+          candidates.sort(key=lambda x: x['cmd_id'])
+          candidate_types = {x['type_name'] for x in candidates}
+
+          methods = []
+          with methods_path.open(encoding='utf-8', newline='') as f:
+              for row in csv.DictReader(f):
+                  rva_text = row.get('rva')
+                  if not rva_text:
+                      continue
+                  try:
+                      rva = int(rva_text, 0)
+                  except ValueError:
+                      continue
+                  try:
+                      params = json.loads(row.get('parameter_types') or '[]')
+                  except json.JSONDecodeError:
+                      params = []
+                  item = dict(row)
+                  item['_rva'] = rva
+                  item['_params'] = params
+                  methods.append(item)
+          methods.sort(key=lambda x: x['_rva'])
+          method_starts = [m['_rva'] for m in methods]
+          exact_methods = defaultdict(list)
+          for m in methods:
+              exact_methods[m['_rva']].append(m)
+
+          handlers = []
+          for m in methods:
+              if len(m['_params']) != 1 or m['_params'][0] not in candidate_types:
+                  continue
+              # Keep the broad protocol receiver owner used by the confirmed WorldPlayerDieNotify consumer.
+              if m.get('type_name') != 'LLCGIEDMIIG':
+                  continue
+              reg = by_type[m['_params'][0]]
+              handlers.append((int(reg['cmd_id']), m['_params'][0], m))
+          handlers.sort(key=lambda x: x[0])
+
+          def method_view(m):
+              return {
+                  'method_index': m.get('method_index'),
+                  'type_definition_index': m.get('type_definition_index'),
+                  'type_name': m.get('type_name'),
+                  'method_name': m.get('method_name'),
+                  'rva': m.get('rva'),
+                  'return_type': m.get('return_type'),
+                  'parameter_types': m.get('parameter_types'),
+              }
+
+          def nearest_method(rva):
+              pos = bisect.bisect_right(method_starts, rva) - 1
+              if pos < 0:
+                  return []
+              start = method_starts[pos]
+              if rva - start > 0x10000:
+                  return []
+              return [method_view(x) for x in exact_methods[start]]
+
+          md = Cs(CS_ARCH_X86, CS_MODE_64)
+          md.detail = True
+
+          analyses = []
+          with PEImage(exe) as image:
+              image_base = image.image_base
+              for cmd_id, type_name, handler in handlers:
+                  start = handler['_rva']
+                  pos = bisect.bisect_right(method_starts, start)
+                  next_start = method_starts[pos] if pos < len(method_starts) else start + 0x500
+                  size = max(0x40, min(next_start - start, 0x800))
+                  code = image.read_rva(start, size)
+                  calls = []
+                  slot_refs = []
+                  instructions = []
+                  for insn in md.disasm(code, image_base + start):
+                      irva = insn.address - image_base
+                      row = {
+                          'rva': f'0x{irva:X}',
+                          'bytes': bytes(insn.bytes).hex(),
+                          'mnemonic': insn.mnemonic,
+                          'op_str': insn.op_str,
+                      }
+                      instructions.append(row)
+                      if insn.mnemonic == 'call' and insn.operands and insn.operands[0].type == CS_OP_IMM:
+                          target = int(insn.operands[0].imm) - image_base
+                          calls.append({
+                              'site_rva': f'0x{irva:X}',
+                              'target_rva': f'0x{target:X}',
+                              'target_methods': [method_view(x) for x in exact_methods.get(target, [])],
+                              'nearest_methods': nearest_method(target),
+                          })
+                      for op in insn.operands:
+                          if op.type != CS_OP_MEM or op.mem.base != X86_REG_RIP:
+                              continue
+                          target = irva + insn.size + int(op.mem.disp)
+                          reg = slot_to_registry.get(target)
+                          if reg is not None:
+                              slot_refs.append({
+                                  'site_rva': f'0x{irva:X}',
+                                  'target_rva': f'0x{target:X}',
+                                  'cmd_id': int(reg['cmd_id']),
+                                  'message_type': reg['type_name'],
+                              })
+                  analyses.append({
+                      'cmd_id': cmd_id,
+                      'message_type': type_name,
+                      'handler': method_view(handler),
+                      'body_size': size,
+                      'registry_slot_refs': slot_refs,
+                      'direct_calls': calls,
+                      'instructions': instructions,
+                  })
+
+          strong_request_callers = [
+              '0x72659E0', '0x92692B0', '0x9BE04B0', '0xBC632E0',
+              '0xBC64560', '0xBC67FB0', '0x13468540'
+          ]
+          result = {
+              'schema': 'genshin-revive-response-correlation-v1',
+              'candidate_rule': 'exactly one metadata field, int32, obfuscated field name BLPJNJBFDJJ; protocol handler owner LLCGIEDMIIG',
+              'candidates': candidates,
+              'handler_analyses': analyses,
+              'confirmed_request_cmd_id': 5232,
+              'confirmed_request_type': by_type[next(r['type_name'] for r in registry if int(r['cmd_id']) == 5232)],
+              'strong_request_native_callers': strong_request_callers,
+              'notes': [
+                  'This pass ranks current-client response candidates by exact native handler structure. It does not assign semantics from opcode proximity.',
+                  'Direct-call and registry-slot relationships are current 7.1 Global evidence; final promotion still requires a link to revive behavior or runtime capture.'
+              ],
+          }
+          Path('revive-response-correlation.json').write_text(json.dumps(result, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+          print(json.dumps({
+              'candidate_count': len(candidates),
+              'handler_count': len(analyses),
+              'handlers': [
+                  {
+                      'cmd_id': x['cmd_id'],
+                      'message_type': x['message_type'],
+                      'handler_rva': x['handler']['rva'],
+                      'slot_refs': x['registry_slot_refs'],
+                      'call_targets': [c['target_rva'] for c in x['direct_calls']],
+                  }
+                  for x in analyses
+              ]
+          }, indent=2, ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: revive-response-correlation
+          path: revive-response-correlation.json
+          if-no-files-found: error
+          retention-days: 7
