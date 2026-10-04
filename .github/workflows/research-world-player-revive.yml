@@ -96,7 +96,6 @@ jobs:
                   })
               owners[owner] = sorted(entries, key=lambda x: x['cmd_id'])
 
-          # Add a compact scalar-field heuristic over the same handler owners.
           scalar_candidates = []
           for p in sorted(candidate_types):
               reg = by_type[p]
@@ -111,6 +110,8 @@ jobs:
 
           result = {
               'request': request,
+              'request_fields': [field_view(x) for x in fields_by_type.get(request_type, [])],
+              'request_methods': [method_view(x) for x in methods if x.get('type_name') == request_type],
               'world_player_die_notify': die,
               'anchor_parameter_users': {k: [method_view(r) for r in v] for k,v in anchor_rows.items()},
               'shared_owner_types': owner_types,
@@ -128,5 +129,66 @@ jobs:
         with:
           name: revive-metadata-neighborhood
           path: revive-metadata-neighborhood.json
+          if-no-files-found: error
+          retention-days: 7
+
+  trace-request-native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install focused research dependencies
+        run: python -m pip install -e . capstone zstandard
+      - name: Fetch pinned exact 7.1 Global samples
+        run: bash scripts/fetch-7.1-samples.sh --output inputs/7.1.0-global --python python
+      - name: Trace request type-slot references and owning methods
+        run: |
+          python - <<'PY'
+          import csv, json
+          from pathlib import Path
+          from genshinre.xrefs import scan_rip_xrefs, inspect_rva
+
+          root = Path('versions/7.1.0-global/windows-x64')
+          exe = Path('inputs/7.1.0-global/GenshinImpact.exe')
+          methods = root / 'metadata/methods.csv'
+          registry = root / 'registry/registry.csv'
+
+          with registry.open(encoding='utf-8', newline='') as f:
+              rows = list(csv.DictReader(f))
+          by_cmd = {int(r['cmd_id']): r for r in rows}
+          request = by_cmd[5232]
+          die = by_cmd[5224]
+          targets = [int(request['type_slot_rva'], 0), int(die['type_slot_rva'], 0)]
+          xrefs = scan_rip_xrefs(exe, targets, window=48, methods_csv=methods)
+
+          callers = {}
+          for matches in xrefs['matches'].values():
+              for hit in matches:
+                  for caller in hit.get('caller_methods', []):
+                      rva = caller.get('rva')
+                      if not rva or rva in callers:
+                          continue
+                      try:
+                          callers[rva] = inspect_rva(exe, int(rva, 0), before=0, after=0x180)
+                      except Exception as exc:
+                          callers[rva] = {'error': str(exc)}
+
+          result = {
+              'request': request,
+              'world_player_die_notify': die,
+              'type_slot_xrefs': xrefs,
+              'caller_windows': callers,
+              'interpretation_gate': 'A request sender/construction edge requires a non-registry-init consumer that loads the exact 5232 runtime type slot. Registry-constructor initialization alone is not semantic evidence.'
+          }
+          Path('revive-request-native-xrefs.json').write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: revive-request-native-xrefs
+          path: revive-request-native-xrefs.json
           if-no-files-found: error
           retention-days: 7
