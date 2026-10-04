@@ -1,0 +1,132 @@
+name: Research 7.1 world player revive
+
+on:
+  push:
+    branches:
+      - research/world-player-revive
+    paths:
+      - '.github/workflows/research-world-player-revive.yml'
+      - 'docs/research-triggers/world-player-revive.md'
+
+permissions:
+  contents: read
+
+jobs:
+  map-metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Map request and world-death handler neighborhood
+        run: |
+          python - <<'PY'
+          import csv, json
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path('versions/7.1.0-global/windows-x64')
+          registry_path = root / 'registry/registry.csv'
+          methods_path = root / 'metadata/methods.csv'
+          fields_path = root / 'metadata/fields.csv'
+
+          with registry_path.open(encoding='utf-8', newline='') as f:
+              registry = list(csv.DictReader(f))
+          by_cmd = {int(r['cmd_id']): r for r in registry}
+          by_type = {r['type_name']: r for r in registry}
+
+          request = by_cmd[5232]
+          die = by_cmd[5224]
+          request_type = request['type_name']
+          die_type = die['type_name']
+
+          methods = []
+          param_users = defaultdict(list)
+          owner_protocol_methods = defaultdict(list)
+          with methods_path.open(encoding='utf-8', newline='') as f:
+              for row in csv.DictReader(f):
+                  try:
+                      params = json.loads(row.get('parameter_types') or '[]')
+                  except json.JSONDecodeError:
+                      params = []
+                  row['_params'] = params
+                  methods.append(row)
+                  for p in params:
+                      if p in by_type and row.get('type_name') != p:
+                          param_users[p].append(row)
+                  if len(params) == 1 and params[0] in by_type and row.get('type_name') != params[0]:
+                      owner_protocol_methods[row.get('type_name','')].append(row)
+
+          anchor_rows = {
+              'WorldPlayerReviveReq_5232': param_users.get(request_type, []),
+              'WorldPlayerDieNotify_5224': param_users.get(die_type, []),
+          }
+          owner_types = sorted({r.get('type_name','') for rows in anchor_rows.values() for r in rows if r.get('type_name')})
+
+          fields_by_type = defaultdict(list)
+          field_headers = []
+          with fields_path.open(encoding='utf-8', newline='') as f:
+              reader = csv.DictReader(f)
+              field_headers = reader.fieldnames or []
+              for row in reader:
+                  fields_by_type[row.get('type_name','')].append(row)
+
+          def method_view(row):
+              return {k: row.get(k) for k in ('method_index','type_definition_index','type_name','method_name','rva','return_type','parameter_types')}
+
+          def field_view(row):
+              return {k: row.get(k) for k in field_headers}
+
+          owners = {}
+          candidate_types = set()
+          for owner in owner_types:
+              rows = owner_protocol_methods.get(owner, [])
+              entries = []
+              for row in rows:
+                  p = row['_params'][0]
+                  reg = by_type[p]
+                  candidate_types.add(p)
+                  entries.append({
+                      'cmd_id': int(reg['cmd_id']),
+                      'message_type': p,
+                      'handler': method_view(row),
+                      'message_fields': [field_view(x) for x in fields_by_type.get(p, [])],
+                  })
+              owners[owner] = sorted(entries, key=lambda x: x['cmd_id'])
+
+          # Add a compact scalar-field heuristic over the same handler owners.
+          scalar_candidates = []
+          for p in sorted(candidate_types):
+              reg = by_type[p]
+              fs = fields_by_type.get(p, [])
+              text = ' '.join(str(v) for row in fs for v in row.values()).lower()
+              if 'int32' in text:
+                  scalar_candidates.append({
+                      'cmd_id': int(reg['cmd_id']),
+                      'message_type': p,
+                      'fields': [field_view(x) for x in fs],
+                  })
+
+          result = {
+              'request': request,
+              'world_player_die_notify': die,
+              'anchor_parameter_users': {k: [method_view(r) for r in v] for k,v in anchor_rows.items()},
+              'shared_owner_types': owner_types,
+              'owner_protocol_methods': owners,
+              'int32_candidates_in_owner_neighborhood': scalar_candidates,
+              'notes': [
+                  'WorldPlayerReviveRsp is expected from historical/current server proto imports to contain retcode field 14, but this script does not promote that semantic shape.',
+                  'Parameter-type adjacency is relationship evidence only. Native handler dispatch / protobuf codec evidence is required for promotion.'
+              ],
+          }
+          Path('revive-metadata-neighborhood.json').write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
+          print(json.dumps(result, indent=2, ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: revive-metadata-neighborhood
+          path: revive-metadata-neighborhood.json
+          if-no-files-found: error
+          retention-days: 7
